@@ -63,19 +63,10 @@ function toLocalInput(iso) {
 
 // ── Sheets API ────────────────────────────────────────────────────────────────
 async function sheetsCall(url, payload) {
-  let res;
-  if (!payload) {
-    // Simple GET for reads
-    res = await fetch(url, { redirect: "follow" });
-  } else {
-    // POST for writes — avoids URL length limits with large screenshot data
-    res = await fetch(url, {
-      method: "POST",
-      redirect: "follow",
-      headers: { "Content-Type": "application/x-www-form-urlencoded" },
-      body: "payload=" + encodeURIComponent(JSON.stringify(payload))
-    });
-  }
+  const reqUrl = payload
+    ? `${url}?payload=${encodeURIComponent(JSON.stringify(payload))}`
+    : url;
+  const res = await fetch(reqUrl, { redirect: "follow" });
   if (!res.ok) throw new Error(`HTTP ${res.status}`);
   const text = await res.text();
   let json;
@@ -84,6 +75,17 @@ async function sheetsCall(url, payload) {
   if (!json.ok) throw new Error(json.error || "Script returned ok:false");
   return json;
 }
+
+// Upload a single screenshot — sends as separate small request
+async function sheetsUploadScreenshot(url, entryId, screenshot, index) {
+  const payload = {
+    action: "uploadScreenshot",
+    entryId: String(entryId),
+    screenshot: { data: screenshot.data, name: screenshot.name || ("screenshot_" + index + ".jpg") }
+  };
+  return sheetsCall(url, payload);
+}
+
 const sheetsGet  = (url)       => sheetsCall(url, null);
 const sheetsPost = (url, body) => sheetsCall(url, body);
 
@@ -390,16 +392,32 @@ function RitaGlucoseTracker() {
     if (!settings.sheetsUrl) return;
     setSyncStatus("syncing");
     try {
-      const res = await sheetsPost(settings.sheetsUrl, {action:"save", entry});
-      if (res.ok) {
-        if (res.screenshots && res.screenshots.length > 0) {
-          const updated = {...entry, screenshots: res.screenshots.map(s => ({...s, data: s.url}))};
-          setLogs(prev => prev.map(l => String(l.id) === String(entry.id) ? updated : l));
+      // Step 1: Save reading without image data (fast, small payload)
+      const entryNoImages = {
+        ...entry,
+        screenshots: (entry.screenshots||[]).map(s => s.url ? {url:s.url,name:s.name} : {name:s.name||"screenshot"}),
+        screenshotCount: entry.screenshots?.length || 0
+      };
+      const res = await sheetsPost(settings.sheetsUrl, {action:"save", entry: entryNoImages});
+      if (!res.ok) { setSyncError(res.error||"Save failed"); setSyncStatus("error"); return; }
+      setSyncStatus("synced");
+
+      // Step 2: Upload each new screenshot individually (background)
+      const newScreenshots = (entry.screenshots||[]).filter(s => s.data && s.data.startsWith("data:"));
+      if (newScreenshots.length > 0) {
+        const driveScreenshots = [...(entry.screenshots||[]).filter(s => s.url)];
+        for (let i = 0; i < newScreenshots.length; i++) {
+          try {
+            const r = await sheetsUploadScreenshot(settings.sheetsUrl, entry.id, newScreenshots[i], i);
+            if (r.ok && r.url) driveScreenshots.push({url:r.url, name:newScreenshots[i].name||"screenshot", data:r.url});
+          } catch(e) { /* skip failed uploads */ }
         }
-        setSyncStatus("synced");
-      } else {
-        setSyncError(res.error || "Save failed");
-        setSyncStatus("error");
+        if (driveScreenshots.length > 0) {
+          const updated = {...entry, screenshots: driveScreenshots};
+          setLogs(prev => prev.map(l => String(l.id) === String(entry.id) ? updated : l));
+          // Save again with Drive URLs
+          await sheetsPost(settings.sheetsUrl, {action:"save", entry:{...entryNoImages, screenshots: driveScreenshots}});
+        }
       }
     } catch(e) { setSyncError(e.message); setSyncStatus("error"); }
   }
