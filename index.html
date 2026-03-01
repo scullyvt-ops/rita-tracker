@@ -422,7 +422,7 @@ function RitaGlucoseTracker() {
     } catch(e) { setSyncError(e.message); setSyncStatus("error"); }
   }
 
-  async function sheetsDeleteUrl) return;
+  async function sheetsDelete(url, id) {
     setSyncStatus("syncing");
     try {
       const res = await sheetsPost(settings.sheetsUrl, {action:"delete", id:String(id)});
