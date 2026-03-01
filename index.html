@@ -23,7 +23,7 @@
   <script src="https://cdnjs.cloudflare.com/ajax/libs/react-dom/18.2.0/umd/react-dom.production.min.js"></script>
   <script src="https://cdnjs.cloudflare.com/ajax/libs/prop-types/15.8.1/prop-types.min.js"></script>
   <script src="https://cdnjs.cloudflare.com/ajax/libs/recharts/2.5.0/Recharts.js"></script>
-  <script src="https://unpkg.com/@babel/standalone@7.23.2/babel.min.js"></script>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/babel-standalone/7.22.5/babel.min.js"></script>
   <script type="text/babel" data-presets="react">
     const { useState, useEffect, useRef, useCallback } = React;
     const { ComposedChart, Area, XAxis, YAxis, CartesianGrid, Tooltip, ReferenceLine, ResponsiveContainer, AreaChart } = Recharts;
@@ -382,20 +382,32 @@ function RitaGlucoseTracker() {
     if (!settings.sheetsUrl) return;
     setSyncStatus("syncing");
     try {
-      // Send full screenshot data so script can upload to Drive
-      const res = await sheetsPost(settings.sheetsUrl, {action:"save", entry});
-      if (res.ok) {
-        // Replace local base64 screenshots with Drive URLs returned from script
-        if (res.screenshots && res.screenshots.length > 0) {
-          const updated = {...entry, screenshots: res.screenshots.map(s => ({
-            ...s, data: s.url
-          }))};
-          setLogs(prev => prev.map(l => String(l.id) === String(entry.id) ? updated : l));
+      // Step 1: Save reading immediately without screenshots (fast)
+      const entryWithoutImages = {
+        ...entry,
+        screenshotCount: entry.screenshots?.length || 0,
+        screenshots: (entry.screenshots||[]).map(s => s.url ? {url:s.url, name:s.name} : {name:s.name})
+      };
+      const res = await sheetsPost(settings.sheetsUrl, {action:"save", entry: entryWithoutImages});
+      if (!res.ok) { setSyncError(res.error || "Save failed"); setSyncStatus("error"); return; }
+      setSyncStatus("synced");
+
+      // Step 2: Upload screenshots to Drive in background (slow, non-blocking)
+      const screenshots = (entry.screenshots||[]).filter(s => s.data && s.data.startsWith("data:"));
+      if (screenshots.length > 0) {
+        setSyncStatus("syncing");
+        try {
+          const entryWithImages = {...entry, screenshots: entry.screenshots};
+          const res2 = await sheetsPost(settings.sheetsUrl, {action:"save", entry: entryWithImages});
+          if (res2.ok && res2.screenshots && res2.screenshots.length > 0) {
+            const updated = {...entry, screenshots: res2.screenshots.map(s => ({...s, data: s.url}))};
+            setLogs(prev => prev.map(l => String(l.id) === String(entry.id) ? updated : l));
+          }
+          setSyncStatus("synced");
+        } catch(e) { 
+          // Screenshot upload failed but reading was saved - not critical
+          setSyncStatus("synced");
         }
-        setSyncStatus("synced");
-      } else {
-        setSyncError(res.error || "Save failed");
-        setSyncStatus("error");
       }
     } catch(e) { setSyncError(e.message); setSyncStatus("error"); }
   }
