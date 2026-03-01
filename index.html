@@ -62,12 +62,20 @@ function toLocalInput(iso) {
 }
 
 // ── Sheets API ────────────────────────────────────────────────────────────────
-// Simple fetch — works from GitHub Pages since there's no sandbox restriction
 async function sheetsCall(url, payload) {
-  const reqUrl = payload
-    ? `${url}?payload=${encodeURIComponent(JSON.stringify(payload))}`
-    : url;
-  const res = await fetch(reqUrl, { redirect: "follow" });
+  let res;
+  if (!payload) {
+    // Simple GET for reads
+    res = await fetch(url, { redirect: "follow" });
+  } else {
+    // POST for writes — avoids URL length limits with large screenshot data
+    res = await fetch(url, {
+      method: "POST",
+      redirect: "follow",
+      headers: { "Content-Type": "application/x-www-form-urlencoded" },
+      body: "payload=" + encodeURIComponent(JSON.stringify(payload))
+    });
+  }
   if (!res.ok) throw new Error(`HTTP ${res.status}`);
   const text = await res.text();
   let json;
