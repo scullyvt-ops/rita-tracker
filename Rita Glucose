@@ -1,0 +1,1172 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8"/>
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no"/>
+  <meta name="apple-mobile-web-app-capable" content="yes"/>
+  <meta name="apple-mobile-web-app-status-bar-style" content="default"/>
+  <meta name="apple-mobile-web-app-title" content="Rita's Tracker"/>
+  <title>Rita's Glucose Tracker</title>
+  <style>
+    * { box-sizing: border-box; margin: 0; padding: 0; -webkit-tap-highlight-color: transparent; }
+    html, body { height: 100%; background: #F7F4EF; }
+    body { overflow-x: hidden; }
+    input[type=number]::-webkit-inner-spin-button,
+    input[type=number]::-webkit-outer-spin-button { -webkit-appearance: none; margin: 0; }
+    input[type=range] { -webkit-appearance: none; }
+    #root { min-height: 100vh; }
+  </style>
+</head>
+<body>
+  <div id="root"></div>
+
+  <!-- Dependencies -->
+  <script crossorigin src="https://unpkg.com/react@18/umd/react.production.min.js"></script>
+  <script crossorigin src="https://unpkg.com/react-dom@18/umd/react-dom.production.min.js"></script>
+  <script crossorigin src="https://unpkg.com/recharts@2.12.7/umd/Recharts.js"></script>
+  <script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
+
+  <script type="text/babel" data-presets="react">
+    // Destructure React hooks
+    const { useState, useEffect, useRef, useCallback } = React;
+
+    // Destructure Recharts components
+    const { ComposedChart, Area, XAxis, YAxis, CartesianGrid, Tooltip, ReferenceLine, ResponsiveContainer, AreaChart } = Recharts;
+
+// ── Constants ─────────────────────────────────────────────────────────────────
+const SETTINGS_KEY  = "rita-glucose-settings-v2";
+const INTERVENTIONS = ["Orange Juice","Glucose Gummies","Glucose Tablets","Apple Juice",
+  "Regular Soda","Honey","Peanut Butter","Crackers","Other"];
+const RANGES = [{label:"24h",hours:24},{label:"48h",hours:48},{label:"7d",hours:168},{label:"All",hours:null}];
+const DEFAULT_SETTINGS = { lowThreshold:70, highThreshold:180, sheetsUrl:"" };
+
+function makeStatus(low, high) {
+  return {
+    LOW:    {label:"Low",    color:"#FF6B6B", bg:"#FFF0F0", icon:"↓", threshold:`< ${low}`},
+    NORMAL: {label:"Normal", color:"#4CAF8A", bg:"#F0FAF5", icon:"✓", threshold:`${low}–${high}`},
+    HIGH:   {label:"High",   color:"#F4A261", bg:"#FFF8F0", icon:"↑", threshold:`> ${high}`},
+  };
+}
+
+function getStatus(v, low, high) {
+  const lo = low ?? 70; const hi = high ?? 180;
+  return v < lo ? "LOW" : v > hi ? "HIGH" : "NORMAL";
+}
+function fmtDate(iso) { return new Date(iso).toLocaleDateString("en-US",{month:"short",day:"numeric",year:"numeric"}); }
+function fmtTime(iso) { return new Date(iso).toLocaleTimeString("en-US",{hour:"numeric",minute:"2-digit"}); }
+function fmtShort(iso) {
+  const d = new Date(iso);
+  return d.toLocaleDateString("en-US",{month:"short",day:"numeric"}) + " " +
+    d.toLocaleTimeString("en-US",{hour:"numeric",minute:"2-digit"});
+}
+function toLocalInput(iso) {
+  if (!iso) return "";
+  const d = new Date(iso);
+  const p = n => String(n).padStart(2,"0");
+  return `${d.getFullYear()}-${p(d.getMonth()+1)}-${p(d.getDate())}T${p(d.getHours())}:${p(d.getMinutes())}`;
+}
+
+// ── Sheets API ────────────────────────────────────────────────────────────────
+async function sheetsCall(url, payload) {
+  const reqUrl = payload
+    ? `${url}?payload=${encodeURIComponent(JSON.stringify(payload))}`
+    : url;
+  const res = await fetch(reqUrl, { method:"GET", redirect:"follow" });
+  const text = await res.text();
+  // Surface the raw response in the error so we can debug it
+  let json;
+  try { json = JSON.parse(text); }
+  catch(e) { throw new Error("Non-JSON response (first 300 chars): " + text.slice(0,300)); }
+  if (!json.ok) throw new Error("Script error: " + (json.error || JSON.stringify(json)));
+  return json;
+}
+const sheetsGet  = (url)       => sheetsCall(url, null);
+const sheetsPost = (url, body) => sheetsCall(url, body);
+
+// ── Chart helpers ─────────────────────────────────────────────────────────────
+function makeDot(low, high) {
+  return function ChartDot(props) {
+    const {cx,cy,payload} = props;
+    if (!cx||!cy||!payload) return null;
+    const STATUS = makeStatus(low,high);
+    const color  = STATUS[getStatus(payload.glucose,low,high)].color;
+    const hasInv = payload.interventions?.length > 0;
+    const hasShot= (payload.screenshotCount||payload.screenshots?.length||0) > 0;
+    return (
+      <g key={`dot-${payload.id||cx}`}>
+        {(hasInv||hasShot) && <circle cx={cx} cy={cy} r={14} fill={color} opacity={0.15}/>}
+        <circle cx={cx} cy={cy} r={hasInv?7:5} fill={color} stroke="white" strokeWidth={2}/>
+        {payload.calledHomestead && !hasInv && <circle cx={cx} cy={cy} r={10} fill="none" stroke={color} strokeWidth={1.5} strokeDasharray="3 2"/>}
+        {hasInv  && <text x={cx} y={cy-18} textAnchor="middle" fontSize={11}>💊</text>}
+        {payload.calledHomestead && <text x={cx+(hasInv?10:12)} y={cy-(hasInv?12:2)} textAnchor="middle" fontSize={10}>📞</text>}
+        {hasShot && <text x={cx-(hasInv?10:0)} y={cy-18} textAnchor="middle" fontSize={10}>📷</text>}
+      </g>
+    );
+  };
+}
+
+function makeTooltip(low, high) {
+  return function ChartTip({active, payload}) {
+    if (!active||!payload?.length) return null;
+    const d = payload[0].payload;
+    const STATUS = makeStatus(low,high);
+    const color  = STATUS[getStatus(d.glucose,low,high)].color;
+    const shotCount = d.screenshotCount || d.screenshots?.length || 0;
+    return (
+      <div style={{background:"white",border:`2px solid ${color}`,borderRadius:10,padding:"10px 14px",
+        fontSize:13,boxShadow:"0 4px 20px rgba(0,0,0,0.12)",fontFamily:"Georgia,serif",minWidth:160}}>
+        <div style={{fontWeight:"bold",fontSize:20,color}}>{d.glucose} <span style={{fontSize:12,color:"#aaa"}}>mg/dL</span></div>
+        <div style={{color:"#888",fontSize:12,marginBottom:4}}>{fmtShort(d.timestamp)}</div>
+        {d.calledHomestead && <div style={{color:"#2D5A3D",fontSize:12}}>📞 Called The Homestead</div>}
+        {d.interventions?.map((inv,i) => <div key={i} style={{color:"#666",fontSize:12}}>💊 {inv.name}{inv.quantity?` · ${inv.quantity}`:""}</div>)}
+        {shotCount > 0 && <div style={{color:"#888",fontSize:12,marginTop:2}}>📷 {shotCount} screenshot{shotCount>1?"s":""}</div>}
+      </div>
+    );
+  };
+}
+
+// ── ThresholdControl ──────────────────────────────────────────────────────────
+function ThresholdControl({label, value, onChange, min, max, color, hint}) {
+  return (
+    <div style={{marginBottom:20}}>
+      <div style={{display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:8}}>
+        <div>
+          <span style={{fontSize:12,letterSpacing:1.5,textTransform:"uppercase",color:"#888"}}>{label}</span>
+          {hint && <div style={{fontSize:11,color:"#bbb",marginTop:2}}>{hint}</div>}
+        </div>
+        <div style={{display:"flex",alignItems:"center",gap:8}}>
+          <button onClick={() => onChange(Math.max(min,value-5))}
+            style={{width:32,height:32,borderRadius:16,border:"1.5px solid #E0DDD8",background:"white",
+              fontSize:18,cursor:"pointer",display:"flex",alignItems:"center",justifyContent:"center",
+              color:"#555",fontWeight:"bold"}}>−</button>
+          <div style={{minWidth:56,textAlign:"center",fontWeight:"bold",fontSize:22,color,fontFamily:"Georgia,serif"}}>{value}</div>
+          <button onClick={() => onChange(Math.min(max,value+5))}
+            style={{width:32,height:32,borderRadius:16,border:"1.5px solid #E0DDD8",background:"white",
+              fontSize:18,cursor:"pointer",display:"flex",alignItems:"center",justifyContent:"center",
+              color:"#555",fontWeight:"bold"}}>+</button>
+        </div>
+      </div>
+      <div style={{position:"relative",height:6,borderRadius:3,background:"#E8E5E0"}}>
+        <div style={{position:"absolute",left:0,top:0,height:"100%",
+          width:`${((value-min)/(max-min))*100}%`,background:color,borderRadius:3,transition:"width 0.15s"}}/>
+        <input type="range" min={min} max={max} step={5} value={value}
+          onChange={e => onChange(Number(e.target.value))}
+          style={{position:"absolute",inset:0,width:"100%",opacity:0,cursor:"pointer",height:"100%"}}/>
+      </div>
+      <div style={{display:"flex",justifyContent:"space-between",fontSize:10,color:"#ccc",marginTop:4}}>
+        <span>{min}</span><span>{max}</span>
+      </div>
+    </div>
+  );
+}
+
+// ── Screenshot components ─────────────────────────────────────────────────────
+function ScreenshotThumb({src, label, onRemove, onClick}) {
+  return (
+    <div style={{position:"relative",display:"inline-block",margin:"4px"}}>
+      <img src={src} alt={label||"screenshot"} onClick={onClick}
+        style={{width:80,height:80,objectFit:"cover",borderRadius:10,border:"2px solid #E0DDD8",cursor:"pointer",display:"block"}}/>
+      {onRemove && (
+        <button onClick={e => {e.stopPropagation(); onRemove();}}
+          style={{position:"absolute",top:-6,right:-6,width:20,height:20,borderRadius:10,background:"#FF6B6B",
+            border:"2px solid white",color:"white",fontSize:12,cursor:"pointer",display:"flex",
+            alignItems:"center",justifyContent:"center",padding:0,lineHeight:1,fontWeight:"bold"}}>×</button>
+      )}
+    </div>
+  );
+}
+
+function Lightbox({screenshots, startIndex, onClose}) {
+  const [idx, setIdx] = useState(startIndex||0);
+  useEffect(() => {
+    function onKey(e) {
+      if (e.key==="Escape") onClose();
+      if (e.key==="ArrowRight") setIdx(i => (i+1)%screenshots.length);
+      if (e.key==="ArrowLeft")  setIdx(i => (i-1+screenshots.length)%screenshots.length);
+    }
+    window.addEventListener("keydown",onKey);
+    return () => window.removeEventListener("keydown",onKey);
+  }, [screenshots.length, onClose]);
+  return (
+    <div onClick={onClose} style={{position:"fixed",inset:0,background:"rgba(0,0,0,0.93)",zIndex:2000,
+      display:"flex",flexDirection:"column",alignItems:"center",justifyContent:"center"}}>
+      <button onClick={onClose} style={{position:"absolute",top:16,right:18,background:"rgba(255,255,255,0.12)",
+        border:"none",color:"white",fontSize:22,cursor:"pointer",zIndex:2001,width:38,height:38,borderRadius:19,
+        display:"flex",alignItems:"center",justifyContent:"center"}}>✕</button>
+      <img src={screenshots[idx].data} alt={screenshots[idx].name} onClick={e => e.stopPropagation()}
+        style={{maxWidth:"94vw",maxHeight:"72vh",objectFit:"contain",borderRadius:12,boxShadow:"0 8px 40px rgba(0,0,0,0.6)"}}/>
+      <div style={{color:"rgba(255,255,255,0.55)",fontSize:12,marginTop:10,fontFamily:"Georgia,serif",
+        maxWidth:"80vw",textAlign:"center",overflow:"hidden",textOverflow:"ellipsis",whiteSpace:"nowrap"}}>
+        {screenshots[idx].name}
+      </div>
+      {screenshots.length > 1 && (
+        <div style={{display:"flex",gap:14,marginTop:14,alignItems:"center"}}>
+          <button onClick={e=>{e.stopPropagation();setIdx(i=>(i-1+screenshots.length)%screenshots.length);}}
+            style={{background:"rgba(255,255,255,0.15)",border:"none",color:"white",fontSize:22,width:44,height:44,borderRadius:22,cursor:"pointer",display:"flex",alignItems:"center",justifyContent:"center"}}>‹</button>
+          <span style={{color:"rgba(255,255,255,0.5)",fontSize:13,minWidth:40,textAlign:"center"}}>{idx+1} / {screenshots.length}</span>
+          <button onClick={e=>{e.stopPropagation();setIdx(i=>(i+1)%screenshots.length);}}
+            style={{background:"rgba(255,255,255,0.15)",border:"none",color:"white",fontSize:22,width:44,height:44,borderRadius:22,cursor:"pointer",display:"flex",alignItems:"center",justifyContent:"center"}}>›</button>
+        </div>
+      )}
+      {screenshots.length > 1 && (
+        <div style={{display:"flex",gap:6,marginTop:14,padding:"0 16px",overflowX:"auto",maxWidth:"94vw"}}>
+          {screenshots.map((s,i) => (
+            <img key={i} src={s.data} alt="" onClick={e=>{e.stopPropagation();setIdx(i);}}
+              style={{width:48,height:48,objectFit:"cover",borderRadius:7,cursor:"pointer",opacity:i===idx?1:0.5,flexShrink:0,
+                border:i===idx?"2.5px solid white":"2.5px solid transparent",transition:"opacity 0.15s"}}/>
+          ))}
+        </div>
+      )}
+    </div>
+  );
+}
+
+function ScreenshotUpload({onAdd}) {
+  const fileRef = useRef();
+  const [dragging, setDragging] = useState(false);
+  function handleFiles(files) {
+    Array.from(files).forEach(file => {
+      if (!file.type.startsWith("image/")) return;
+      const reader = new FileReader();
+      reader.onload = e => onAdd({data:e.target.result,name:file.name,type:file.type,size:file.size,addedAt:new Date().toISOString()});
+      reader.readAsDataURL(file);
+    });
+  }
+  return (
+    <div onDrop={e=>{e.preventDefault();setDragging(false);handleFiles(e.dataTransfer.files);}}
+      onDragOver={e=>{e.preventDefault();setDragging(true);}} onDragLeave={()=>setDragging(false)}
+      onClick={()=>fileRef.current.click()}
+      style={{border:`2px dashed ${dragging?"#2D5A3D":"#C8C4BE"}`,borderRadius:12,padding:"18px 16px",
+        textAlign:"center",cursor:"pointer",background:dragging?"#F0FAF5":"#FAFAF8",transition:"all 0.2s"}}>
+      <div style={{fontSize:30,marginBottom:6}}>📷</div>
+      <div style={{fontSize:13,color:"#888",fontFamily:"Georgia,serif",lineHeight:1.5}}>
+        <strong style={{color:"#2D5A3D"}}>Tap to attach a screenshot</strong><br/>
+        <span style={{fontSize:11,color:"#bbb"}}>PNG, JPG, HEIC · stored locally only</span>
+      </div>
+      <input ref={fileRef} type="file" accept="image/*" multiple style={{display:"none"}} onChange={e=>handleFiles(e.target.files)}/>
+    </div>
+  );
+}
+
+function InterventionEditor({interventions, onChange}) {
+  const [name, setName] = useState("");
+  const [qty,  setQty]  = useState("");
+  const iStyle = {width:"100%",border:"1.5px solid #E0DDD8",borderRadius:10,padding:"12px 14px",
+    fontSize:16,fontFamily:"Georgia,serif",background:"#FAFAF8",color:"#2C2C2C",boxSizing:"border-box",outline:"none"};
+  function add() {
+    if (!name) return;
+    onChange([...interventions, {name, quantity:qty, time:new Date().toISOString()}]);
+    setName(""); setQty("");
+  }
+  return (
+    <div>
+      <div style={{display:"flex",flexWrap:"wrap",marginBottom:8}}>
+        {interventions.map((inv,idx) => (
+          <div key={idx} style={{display:"inline-flex",alignItems:"center",gap:6,background:"#F0EDE8",
+            borderRadius:8,padding:"5px 10px",fontSize:12,margin:"3px 3px 3px 0"}}>
+            <span>{inv.name}{inv.quantity?` · ${inv.quantity}`:""}</span>
+            <button onClick={() => onChange(interventions.filter((_,i)=>i!==idx))}
+              style={{background:"none",border:"none",color:"#999",cursor:"pointer",fontSize:14,padding:0}}>×</button>
+          </div>
+        ))}
+      </div>
+      <select style={{...iStyle,marginBottom:8}} value={name} onChange={e=>setName(e.target.value)}>
+        <option value="">Select intervention...</option>
+        {INTERVENTIONS.map(i => <option key={i} value={i}>{i}</option>)}
+      </select>
+      <input style={{...iStyle,marginBottom:8}} placeholder="Quantity (e.g. 4 oz, 2 gummies)" value={qty} onChange={e=>setQty(e.target.value)}/>
+      <button style={{width:"100%",padding:"16px",background:"#E8E5E0",color:"#2C2C2C",border:"none",borderRadius:12,
+        fontSize:16,cursor:"pointer",fontFamily:"Georgia,serif"}} onClick={add}>+ Add Intervention</button>
+    </div>
+  );
+}
+
+// ── Sync status badge ─────────────────────────────────────────────────────────
+function SyncBadge({status, errorMsg}) {
+  const styles = {
+    synced:  {bg:"#F0FAF5", color:"#2D5A3D", icon:"✅", text:"Synced to Sheets"},
+    syncing: {bg:"#FFF8F0", color:"#8B6914", icon:"⏳", text:"Saving..."},
+    error:   {bg:"#FFF0F0", color:"#CC3333", icon:"⚠️", text:"Sync failed"},
+    offline: {bg:"#F7F4EF", color:"#888",    icon:"💾", text:"Local only — add Sheets URL in Settings"},
+  };
+  const s = styles[status] || styles.offline;
+  return (
+    <div style={{background:s.bg,borderRadius:8,padding:"8px 12px",fontFamily:"Georgia,serif"}}>
+      <div style={{display:"flex",alignItems:"center",gap:6,fontSize:12,color:s.color}}>
+        <span>{s.icon}</span><span>{s.text}</span>
+      </div>
+      {status==="error" && errorMsg && (
+        <div style={{fontSize:11,color:"#CC3333",marginTop:4,wordBreak:"break-all",lineHeight:1.4}}>
+          {errorMsg}
+        </div>
+      )}
+    </div>
+  );
+}
+
+// ── Main App ──────────────────────────────────────────────────────────────────
+function RitaGlucoseTracker() {
+  const [logs, setLogs]             = useState([]);
+  const [view, setView]             = useState("home");
+  const [selectedLog, setSelectedLog] = useState(null);
+  const [filter, setFilter]         = useState("ALL");
+  const [chartRange, setChartRange] = useState(48);
+  const [lightbox, setLightbox]     = useState(null);
+  const [settings, setSettings]     = useState(DEFAULT_SETTINGS);
+  const [pendingLow,  setPendingLow]  = useState(DEFAULT_SETTINGS.lowThreshold);
+  const [pendingHigh, setPendingHigh] = useState(DEFAULT_SETTINGS.highThreshold);
+  const [pendingUrl,  setPendingUrl]  = useState("");
+  const [showDeleteConfirm, setShowDeleteConfirm] = useState(false);
+  const [syncStatus, setSyncStatus] = useState("offline"); // offline | syncing | synced | error
+  const [syncError,  setSyncError]  = useState("");       // last error message for debugging
+  const [loadStatus, setLoadStatus] = useState("idle");   // idle | loading | done | error
+
+  const EMPTY_FORM = {glucose:"",timestamp:"",calledHomestead:false,calledTime:"",interventions:[],notes:"",screenshots:[]};
+  const [form, setForm]   = useState(EMPTY_FORM);
+  const [editId, setEditId] = useState(null);
+
+  const LOW    = settings.lowThreshold;
+  const HIGH   = settings.highThreshold;
+  const STATUS = makeStatus(LOW, HIGH);
+  function liveStatus(g) { return getStatus(g, LOW, HIGH); }
+
+  // ── Load settings ────────────────────────────────────────────────────────
+  useEffect(() => {
+    try {
+      const s = localStorage.getItem(SETTINGS_KEY);
+      if (s) {
+        const ps = JSON.parse(s);
+        setSettings(ps);
+        setPendingLow(ps.lowThreshold);
+        setPendingHigh(ps.highThreshold);
+        setPendingUrl(ps.sheetsUrl || "");
+      }
+    } catch(e) {}
+  }, []);
+
+  useEffect(() => {
+    try { localStorage.setItem(SETTINGS_KEY, JSON.stringify(settings)); } catch(e) {}
+  }, [settings]);
+
+  // ── Load data: Sheets first, fallback to nothing (no demo data) ──────────
+  useEffect(() => {
+    if (!settings.sheetsUrl) {
+      setSyncStatus("offline");
+      setLoadStatus("done");
+      return;
+    }
+    setLoadStatus("loading");
+    setSyncStatus("syncing");
+    sheetsGet(settings.sheetsUrl)
+      .then(data => {
+        if (data.ok) {
+          setLogs(data.entries || []);
+          setSyncStatus("synced");
+        } else {
+          setSyncStatus("error");
+        }
+        setLoadStatus("done");
+      })
+      .catch(err => {
+        setSyncError(err.message);
+        setSyncStatus("error");
+        setLoadStatus("done");
+      });
+  }, [settings.sheetsUrl]);
+
+  // ── Sheets write helpers ─────────────────────────────────────────────────
+  async function sheetsSave(entry) {
+    if (!settings.sheetsUrl) return;
+    setSyncStatus("syncing");
+    try {
+      const res = await sheetsPost(settings.sheetsUrl, {action:"save", entry:{
+        ...entry,
+        screenshotCount: entry.screenshots?.length || 0,
+        screenshots: undefined, // never send screenshot data to Sheets
+      }});
+      setSyncStatus(res.ok ? "synced" : "error");
+    } catch(e) { setSyncError(e.message); setSyncStatus("error"); }
+  }
+
+  async function sheetsDelete(id) {
+    if (!settings.sheetsUrl) return;
+    setSyncStatus("syncing");
+    try {
+      const res = await sheetsPost(settings.sheetsUrl, {action:"delete", id:String(id)});
+      setSyncStatus(res.ok ? "synced" : "error");
+    } catch(e) { setSyncError(e.message); setSyncStatus("error"); }
+  }
+
+  // ── CRUD ─────────────────────────────────────────────────────────────────
+  function openAdd() { setEditId(null); setForm(EMPTY_FORM); setView("form"); }
+
+  function openEdit(log) {
+    setEditId(log.id);
+    setForm({
+      glucose:         String(log.glucose),
+      timestamp:       toLocalInput(log.timestamp),
+      calledHomestead: log.calledHomestead,
+      calledTime:      toLocalInput(log.calledTime),
+      interventions:   (log.interventions||[]).map(i=>({...i})),
+      notes:           log.notes||"",
+      screenshots:     (log.screenshots||[]).map(s=>({...s})),
+    });
+    setView("form");
+  }
+
+  function saveForm() {
+    if (!form.glucose) return;
+    const g = parseInt(form.glucose);
+    const toISO = local => local ? new Date(local).toISOString() : null;
+    const entry = {
+      id:              editId || Date.now(),
+      timestamp:       form.timestamp ? new Date(form.timestamp).toISOString() : new Date().toISOString(),
+      glucose:         g,
+      status:          liveStatus(g),
+      calledHomestead: form.calledHomestead,
+      calledTime:      form.calledHomestead ? toISO(form.calledTime) : null,
+      interventions:   form.interventions,
+      notes:           form.notes||"",
+      screenshots:     form.screenshots||[],
+    };
+    if (editId) {
+      setLogs(prev => prev.map(l => l.id===editId ? entry : l));
+      setSelectedLog(entry);
+      setView("detail");
+    } else {
+      setLogs(prev => [entry, ...prev]);
+      setView("home");
+    }
+    sheetsSave(entry);
+    setForm(EMPTY_FORM); setEditId(null);
+  }
+
+  function deleteLog(id) {
+    setLogs(prev => prev.filter(l => l.id !== id));
+    sheetsDelete(id);
+    setShowDeleteConfirm(false);
+    setView("home");
+  }
+
+  function saveSettings() {
+    if (pendingLow >= pendingHigh) return; // low must be < high — enforced by sliders
+    const newSettings = {lowThreshold:pendingLow, highThreshold:pendingHigh, sheetsUrl:pendingUrl.trim()};
+    setSettings(newSettings);
+    setView("home");
+    // If URL changed, reload data from Sheets
+    if (pendingUrl.trim() !== settings.sheetsUrl) {
+      setLoadStatus("loading");
+      setSyncStatus("syncing");
+      setLogs([]);
+      sheetsGet(pendingUrl.trim())
+        .then(data => {
+          if (data.ok) { setLogs(data.entries||[]); setSyncStatus("synced"); }
+          else setSyncStatus("error");
+          setLoadStatus("done");
+        })
+        .catch(() => { setSyncStatus("error"); setLoadStatus("done"); });
+    }
+  }
+
+  function downloadCSV() {
+    if (logs.length === 0) return;
+    const sorted = [...logs].sort((a,b) => new Date(a.timestamp)-new Date(b.timestamp));
+    const headers = ["Date","Time","Glucose (mg/dL)","Status","Called Homestead","Call Time",
+      "Intervention 1","Qty 1","Intervention 2","Qty 2","Intervention 3","Qty 3","Screenshots #","Notes"];
+    const esc = v => {
+      if (v===null||v===undefined) return "";
+      const s = String(v);
+      return s.includes(",")||s.includes('"')||s.includes("\n") ? `"${s.replace(/"/g,'""')}"` : s;
+    };
+    const rows = sorted.map(l => {
+      const d = new Date(l.timestamp);
+      const invs = l.interventions||[];
+      return [
+        d.toLocaleDateString("en-US",{month:"2-digit",day:"2-digit",year:"numeric"}),
+        d.toLocaleTimeString("en-US",{hour:"2-digit",minute:"2-digit"}),
+        l.glucose, liveStatus(l.glucose),
+        l.calledHomestead?"Yes":"No",
+        l.calledTime ? new Date(l.calledTime).toLocaleTimeString("en-US",{hour:"2-digit",minute:"2-digit"}) : "",
+        invs[0]?.name||"", invs[0]?.quantity||"",
+        invs[1]?.name||"", invs[1]?.quantity||"",
+        invs[2]?.name||"", invs[2]?.quantity||"",
+        (l.screenshots||[]).length || l.screenshotCount || 0,
+        l.notes||""
+      ].map(esc).join(",");
+    });
+    const csv  = [headers.join(","), ...rows].join("\r\n");
+    const blob = new Blob([csv], {type:"text/csv;charset=utf-8;"});
+    const url  = URL.createObjectURL(blob);
+    const a    = document.createElement("a");
+    a.href=url; a.download=`Rita_Glucose_${new Date().toISOString().slice(0,10)}.csv`;
+    document.body.appendChild(a); a.click();
+    document.body.removeChild(a); URL.revokeObjectURL(url);
+  }
+
+  // ── Derived data ─────────────────────────────────────────────────────────
+  const sortedLogs = [...logs].sort((a,b) => new Date(b.timestamp)-new Date(a.timestamp));
+  const lastEntry  = sortedLogs[0];
+  const chartData  = [...logs].sort((a,b)=>new Date(a.timestamp)-new Date(b.timestamp))
+    .filter(l => !chartRange || new Date(l.timestamp) > new Date(Date.now()-chartRange*3600000));
+  const sparkData  = [...logs].sort((a,b)=>new Date(a.timestamp)-new Date(b.timestamp))
+    .filter(l => new Date(l.timestamp) > new Date(Date.now()-48*3600000));
+  const counts = {LOW:0,NORMAL:0,HIGH:0};
+  logs.forEach(l => { counts[liveStatus(l.glucose)]++; });
+
+  // ── Shared styles ─────────────────────────────────────────────────────────
+  const S = {
+    app:     {fontFamily:"'Georgia',serif",maxWidth:420,margin:"0 auto",minHeight:"100vh",background:"#F7F4EF",color:"#2C2C2C"},
+    hdr:     {background:"linear-gradient(135deg,#2D5A3D 0%,#1A3D2B 100%)",padding:"48px 24px 24px",color:"white"},
+    card:    {background:"white",borderRadius:16,padding:20,margin:"12px 16px",boxShadow:"0 2px 12px rgba(0,0,0,0.06)"},
+    input:   {width:"100%",border:"1.5px solid #E0DDD8",borderRadius:10,padding:"12px 14px",fontSize:16,
+               fontFamily:"Georgia,serif",background:"#FAFAF8",color:"#2C2C2C",boxSizing:"border-box",outline:"none"},
+    lbl:     {fontSize:12,letterSpacing:1.5,textTransform:"uppercase",color:"#888",marginBottom:6,display:"block"},
+    tog:     a=>({padding:"10px 20px",borderRadius:20,border:"none",background:a?"#2D5A3D":"#E8E5E0",
+               color:a?"white":"#666",fontSize:13,cursor:"pointer",fontFamily:"Georgia,serif"}),
+    primBtn: {width:"100%",padding:"16px",background:"linear-gradient(135deg,#2D5A3D,#1A3D2B)",color:"white",
+               border:"none",borderRadius:12,fontSize:16,cursor:"pointer",fontFamily:"Georgia,serif",fontWeight:"bold"},
+    badge:   s=>({display:"inline-flex",alignItems:"center",gap:6,background:STATUS[s]?.bg||"#f0f0f0",
+               color:STATUS[s]?.color||"#666",borderRadius:20,padding:"4px 12px",fontSize:13,fontWeight:"bold",
+               border:`1.5px solid ${STATUS[s]?.color||"#ccc"}`}),
+    circle:  s=>({width:50,height:50,borderRadius:25,background:STATUS[s]?.bg||"#f0f0f0",
+               border:`2px solid ${STATUS[s]?.color||"#ccc"}`,display:"flex",alignItems:"center",
+               justifyContent:"center",fontWeight:"bold",color:STATUS[s]?.color||"#666",fontSize:15,flexShrink:0}),
+    nav:     {display:"flex",background:"white",borderTop:"1px solid #E8E5E0",position:"fixed",bottom:0,
+               left:"50%",transform:"translateX(-50%)",width:"100%",maxWidth:420,zIndex:100},
+    navBtn:  a=>({flex:1,padding:"12px 0",border:"none",background:"none",color:a?"#2D5A3D":"#aaa",
+               fontSize:10,cursor:"pointer",display:"flex",flexDirection:"column",alignItems:"center",
+               gap:3,fontFamily:"Georgia,serif",fontWeight:a?"bold":"normal"}),
+    backBtn: {background:"none",border:"none",color:"rgba(255,255,255,0.8)",fontSize:14,cursor:"pointer",
+               padding:"0 0 12px",display:"flex",alignItems:"center",gap:4,fontFamily:"Georgia,serif"},
+  };
+
+  function NavBar({active}) {
+    return (
+      <div style={S.nav}>
+        <button style={S.navBtn(active==="home")} onClick={()=>setView("home")}><span style={{fontSize:20}}>📋</span>Log</button>
+        <button style={S.navBtn(active==="chart")} onClick={()=>setView("chart")}><span style={{fontSize:20}}>📈</span>Chart</button>
+        <button style={{...S.navBtn(false),color:"#2D5A3D"}} onClick={openAdd}><span style={{fontSize:26,lineHeight:1}}>+</span>Add</button>
+        <button style={S.navBtn(active==="settings")} onClick={()=>{setPendingLow(LOW);setPendingHigh(HIGH);setPendingUrl(settings.sheetsUrl||"");setView("settings");}}>
+          <span style={{fontSize:20}}>⚙️</span>Settings
+        </button>
+      </div>
+    );
+  }
+
+  function DeleteModal({onConfirm, onCancel}) {
+    return (
+      <div style={{position:"fixed",inset:0,background:"rgba(0,0,0,0.5)",zIndex:3000,
+        display:"flex",alignItems:"center",justifyContent:"center",padding:"0 24px"}}>
+        <div style={{background:"white",borderRadius:20,padding:28,maxWidth:320,width:"100%",
+          textAlign:"center",boxShadow:"0 20px 60px rgba(0,0,0,0.3)",fontFamily:"Georgia,serif"}}>
+          <div style={{fontSize:40,marginBottom:12}}>🗑️</div>
+          <h3 style={{margin:"0 0 8px",fontSize:18}}>Delete this reading?</h3>
+          <p style={{margin:"0 0 24px",color:"#888",fontSize:14,lineHeight:1.5}}>
+            This will remove it from the app{settings.sheetsUrl ? " and Google Sheets" : ""}.
+          </p>
+          <div style={{display:"flex",gap:12}}>
+            <button onClick={onCancel}
+              style={{flex:1,padding:"13px",borderRadius:12,border:"1.5px solid #E0DDD8",
+                background:"white",cursor:"pointer",fontFamily:"Georgia,serif",fontSize:15}}>Cancel</button>
+            <button onClick={onConfirm}
+              style={{flex:1,padding:"13px",borderRadius:12,border:"none",background:"#FF6B6B",
+                color:"white",cursor:"pointer",fontFamily:"Georgia,serif",fontSize:15,fontWeight:"bold"}}>Delete</button>
+          </div>
+        </div>
+      </div>
+    );
+  }
+
+  // ── Loading screen ────────────────────────────────────────────────────────
+  if (loadStatus === "loading") {
+    return (
+      <div style={{...S.app,display:"flex",flexDirection:"column",alignItems:"center",justifyContent:"center",minHeight:"100vh"}}>
+        <div style={{fontSize:48,marginBottom:16}}>🩺</div>
+        <div style={{fontSize:18,fontWeight:"bold",color:"#2D5A3D",marginBottom:8}}>Loading Rita's data…</div>
+        <div style={{fontSize:13,color:"#888"}}>Connecting to Google Sheets</div>
+      </div>
+    );
+  }
+
+  // ── SETTINGS VIEW ─────────────────────────────────────────────────────────
+  if (view === "settings") {
+    const prevSTATUS = makeStatus(pendingLow, pendingHigh);
+    return (
+      <div style={S.app}>
+        <div style={S.hdr}>
+          <p style={{fontSize:13,opacity:0.7,letterSpacing:2,textTransform:"uppercase",marginBottom:4}}>Glucose Tracker</p>
+          <h1 style={{fontSize:28,fontWeight:"bold",margin:0,letterSpacing:-0.5}}>Settings</h1>
+          <p style={{fontSize:13,opacity:0.6,marginTop:4,fontStyle:"italic"}}>Rita · The Homestead</p>
+        </div>
+        <div style={{padding:"4px 0 100px"}}>
+
+          {/* ── Google Sheets ── */}
+          <div style={S.card}>
+            <label style={S.lbl}>🟢 Google Sheets Integration</label>
+            <div style={{marginBottom:14}}>
+              <SyncBadge status={syncStatus} errorMsg={syncError}/>
+            </div>
+            <p style={{margin:"0 0 12px",fontSize:13,color:"#555",lineHeight:1.6}}>
+              Paste your Apps Script Web App URL here. All readings will be saved directly to your Google Sheet in real time — and loaded from it when you open the app on any device.
+            </p>
+            <label style={S.lbl}>Web App URL</label>
+            <input style={{...S.input,fontSize:13}} placeholder="https://script.google.com/macros/s/…/exec"
+              value={pendingUrl} onChange={e=>setPendingUrl(e.target.value)}/>
+            {!pendingUrl && (
+              <div style={{background:"#FFF8F0",border:"1px solid #F4A26150",borderRadius:10,
+                padding:"12px 14px",fontSize:12,color:"#8B6914",marginTop:12,lineHeight:1.6}}>
+                <strong>Don't have a URL yet?</strong> Download the Apps Script file below,
+                paste it into Google Sheets → Extensions → Apps Script, deploy as a Web App,
+                then paste the URL here.
+              </div>
+            )}
+            <div style={{marginTop:12}}>
+              <label style={S.lbl}>Setup steps</label>
+              <ol style={{margin:0,padding:"0 0 0 18px",fontSize:13,color:"#555",lineHeight:2.2}}>
+                <li>Create a new <strong>Google Sheet</strong></li>
+                <li>Click <strong>Extensions → Apps Script</strong></li>
+                <li>Delete existing code, paste the <strong>Apps Script</strong> file (download below)</li>
+                <li>Click <strong>Deploy → New deployment → Web App</strong></li>
+                <li>Set <em>Execute as: Me</em> · <em>Who has access: Anyone</em></li>
+                <li>Click <strong>Deploy</strong>, authorize, copy the URL</li>
+                <li>Paste the URL in the field above and tap <strong>Save Settings</strong></li>
+              </ol>
+            </div>
+          </div>
+
+          {/* Thresholds */}
+          <div style={S.card}>
+            <label style={S.lbl}>Glucose Alert Thresholds</label>
+            <p style={{margin:"0 0 20px",fontSize:13,color:"#888",lineHeight:1.5}}>
+              Adjust levels that define Low and High alerts for Rita.
+            </p>
+            <ThresholdControl label="Low Alert" value={pendingLow}
+              onChange={v=>{if(v<pendingHigh)setPendingLow(v);}} min={40} max={120} color="#FF6B6B"
+              hint={`Readings below ${pendingLow} mg/dL will show as Low`}/>
+            <ThresholdControl label="High Alert" value={pendingHigh}
+              onChange={v=>{if(v>pendingLow)setPendingHigh(v);}} min={120} max={300} color="#F4A261"
+              hint={`Readings above ${pendingHigh} mg/dL will show as High`}/>
+            <div style={{background:"#F7F4EF",borderRadius:12,padding:"14px 16px",marginTop:4}}>
+              <div style={{fontSize:11,letterSpacing:1.5,textTransform:"uppercase",color:"#aaa",marginBottom:10}}>Preview</div>
+              <div style={{display:"flex",gap:8,justifyContent:"center",flexWrap:"wrap"}}>
+                {["LOW","NORMAL","HIGH"].map(k => (
+                  <span key={k} style={{display:"inline-flex",alignItems:"center",gap:6,
+                    background:prevSTATUS[k].bg,color:prevSTATUS[k].color,borderRadius:20,
+                    padding:"4px 12px",fontSize:13,fontWeight:"bold",border:`1.5px solid ${prevSTATUS[k].color}`}}>
+                    {prevSTATUS[k].icon} {prevSTATUS[k].label} {prevSTATUS[k].threshold}
+                  </span>
+                ))}
+              </div>
+            </div>
+          </div>
+
+          {/* Export */}
+          <div style={S.card}>
+            <label style={S.lbl}>📊 Export Data</label>
+            <p style={{margin:"0 0 14px",fontSize:13,color:"#555",lineHeight:1.6}}>
+              Download all readings as a CSV. Opens in Excel, Numbers, or Google Sheets.
+            </p>
+            <button onClick={downloadCSV}
+              style={{...S.primBtn,display:"flex",alignItems:"center",justifyContent:"center",gap:8}}>
+              <span style={{fontSize:18}}>⬇️</span> Download CSV ({logs.length} reading{logs.length!==1?"s":""})
+            </button>
+          </div>
+
+          {/* iPhone */}
+          <div style={S.card}>
+            <label style={S.lbl}>📱 Access on iPhone</label>
+            <p style={{margin:"0 0 14px",fontSize:13,color:"#555",lineHeight:1.6}}>
+              Add this app to your iPhone home screen so it opens like a native app.
+            </p>
+            <div style={{borderLeft:"3px solid #2D5A3D",paddingLeft:12,marginBottom:10}}>
+              <p style={{margin:0,fontSize:13,color:"#333",fontWeight:"bold"}}>Steps in Safari:</p>
+              <ol style={{margin:"6px 0 0",padding:"0 0 0 16px",fontSize:13,color:"#555",lineHeight:2}}>
+                <li>Open this app's URL in <strong>Safari</strong> on your iPhone</li>
+                <li>Tap the <strong>Share</strong> button ⬆️ at the bottom of the screen</li>
+                <li>Tap <strong>"Add to Home Screen"</strong></li>
+                <li>Name it <strong>"Rita's Tracker"</strong> → tap <strong>Add</strong></li>
+              </ol>
+            </div>
+            {settings.sheetsUrl ? (
+              <div style={{background:"#F0FAF5",border:"1px solid #4CAF8A40",borderRadius:10,padding:"10px 14px",fontSize:12,color:"#2D5A3D"}}>
+                ✅ With Google Sheets connected, your data loads from any device automatically.
+              </div>
+            ) : (
+              <div style={{background:"#FFF8F0",border:"1px solid #F4A26150",borderRadius:10,padding:"10px 14px",fontSize:12,color:"#8B6914"}}>
+                ⚠️ Without Google Sheets, data only lives in Safari on this device.
+              </div>
+            )}
+          </div>
+
+          <div style={{padding:"0 16px"}}>
+            <button style={S.primBtn} onClick={saveSettings}>Save Settings</button>
+            <button style={{...S.primBtn,background:"transparent",color:"#888",border:"none",
+              marginTop:8,fontSize:14,fontWeight:"normal"}} onClick={()=>setView("home")}>Cancel</button>
+          </div>
+        </div>
+        <NavBar active="settings"/>
+      </div>
+    );
+  }
+
+  // ── FORM VIEW (Add + Edit) ────────────────────────────────────────────────
+  if (view === "form") {
+    const isEdit  = editId !== null;
+    const gVal    = parseInt(form.glucose);
+    const gStatus = form.glucose && !isNaN(gVal) ? liveStatus(gVal) : null;
+    return (
+      <div style={S.app}>
+        {lightbox && <Lightbox screenshots={lightbox.screenshots} startIndex={lightbox.startIndex} onClose={()=>setLightbox(null)}/>}
+        {showDeleteConfirm && <DeleteModal onConfirm={()=>deleteLog(editId)} onCancel={()=>setShowDeleteConfirm(false)}/>}
+        <div style={S.hdr}>
+          <button style={S.backBtn} onClick={()=>{setView(isEdit?"detail":"home");setForm(EMPTY_FORM);setEditId(null);}}>
+            ← {isEdit?"Cancel":"Back"}
+          </button>
+          <h1 style={{fontSize:22,fontWeight:"bold",margin:0}}>{isEdit?"✏️ Edit Reading":"New Reading"}</h1>
+          <p style={{fontSize:13,opacity:0.6,marginTop:4,fontStyle:"italic"}}>Rita · The Homestead</p>
+        </div>
+        <div style={{padding:"4px 0 120px"}}>
+          <div style={S.card}>
+            <label style={S.lbl}>Blood Glucose (mg/dL)</label>
+            <input style={{...S.input,fontSize:40,fontWeight:"bold",textAlign:"center",padding:"14px"}}
+              type="number" placeholder="000" value={form.glucose}
+              onChange={e=>setForm(f=>({...f,glucose:e.target.value}))}/>
+            {gStatus && (
+              <div style={{textAlign:"center",marginTop:10}}>
+                <span style={S.badge(gStatus)}>{STATUS[gStatus].icon} {STATUS[gStatus].label} · {STATUS[gStatus].threshold} mg/dL</span>
+              </div>
+            )}
+          </div>
+          <div style={S.card}>
+            <label style={S.lbl}>Date / Time of Reading</label>
+            <input style={S.input} type="datetime-local" value={form.timestamp}
+              onChange={e=>setForm(f=>({...f,timestamp:e.target.value}))}/>
+            <p style={{margin:"8px 0 0",fontSize:11,color:"#bbb"}}>Leave blank to use current time when saving</p>
+          </div>
+          <div style={S.card}>
+            <label style={S.lbl}>The Homestead</label>
+            <div style={{display:"flex",gap:10}}>
+              <button style={{...S.tog(form.calledHomestead),flex:1}} onClick={()=>setForm(f=>({...f,calledHomestead:true}))}>📞 Called</button>
+              <button style={{...S.tog(!form.calledHomestead),flex:1}} onClick={()=>setForm(f=>({...f,calledHomestead:false}))}>Not Called</button>
+            </div>
+            {form.calledHomestead && (
+              <div style={{marginTop:12}}>
+                <label style={S.lbl}>Time of Call</label>
+                <input style={S.input} type="datetime-local" value={form.calledTime}
+                  onChange={e=>setForm(f=>({...f,calledTime:e.target.value}))}/>
+              </div>
+            )}
+          </div>
+          <div style={S.card}>
+            <label style={S.lbl}>Interventions Given</label>
+            <InterventionEditor interventions={form.interventions} onChange={invs=>setForm(f=>({...f,interventions:invs}))}/>
+          </div>
+          <div style={S.card}>
+            <label style={S.lbl}>Screenshots</label>
+            <p style={{margin:"0 0 12px",fontSize:12,color:"#999",lineHeight:1.5}}>
+              Photos are stored on this device only — not uploaded to Google Sheets.
+            </p>
+            {form.screenshots.length > 0 && (
+              <div style={{display:"flex",flexWrap:"wrap",marginBottom:12}}>
+                {form.screenshots.map((s,i) => (
+                  <ScreenshotThumb key={i} src={s.data} label={s.name}
+                    onRemove={()=>setForm(f=>({...f,screenshots:f.screenshots.filter((_,j)=>j!==i)}))}
+                    onClick={()=>setLightbox({screenshots:form.screenshots,startIndex:i})}/>
+                ))}
+              </div>
+            )}
+            <ScreenshotUpload onAdd={s=>setForm(f=>({...f,screenshots:[...f.screenshots,s]}))}/>
+            {form.screenshots.length > 0 && (
+              <p style={{margin:"8px 0 0",fontSize:11,color:"#bbb",textAlign:"center"}}>
+                {form.screenshots.length} screenshot{form.screenshots.length>1?"s":""} · tap to preview
+              </p>
+            )}
+          </div>
+          <div style={S.card}>
+            <label style={S.lbl}>Notes</label>
+            <textarea style={{...S.input,minHeight:80,resize:"vertical"}} placeholder="Any additional observations..."
+              value={form.notes} onChange={e=>setForm(f=>({...f,notes:e.target.value}))}/>
+          </div>
+          <div style={{padding:"0 16px",display:"flex",flexDirection:"column",gap:10}}>
+            <button style={{...S.primBtn,opacity:form.glucose?1:0.5}} onClick={saveForm} disabled={!form.glucose}>
+              {isEdit?"✅ Save Changes":"Save Reading"}
+            </button>
+            {isEdit && (
+              <button onClick={()=>setShowDeleteConfirm(true)}
+                style={{...S.primBtn,background:"transparent",color:"#FF6B6B",border:"1.5px solid #FF6B6B"}}>
+                Delete Reading
+              </button>
+            )}
+          </div>
+        </div>
+      </div>
+    );
+  }
+
+  // ── CHART VIEW ────────────────────────────────────────────────────────────
+  if (view === "chart") {
+    const yMin = chartData.length ? Math.max(0,Math.min(...chartData.map(d=>d.glucose))-20) : 40;
+    const yMax = chartData.length ? Math.max(...chartData.map(d=>d.glucose))+20 : 250;
+    const ChartDot = makeDot(LOW, HIGH);
+    const ChartTip = makeTooltip(LOW, HIGH);
+    return (
+      <div style={S.app}>
+        <div style={S.hdr}>
+          <p style={{fontSize:13,opacity:0.7,letterSpacing:2,textTransform:"uppercase",marginBottom:4}}>Glucose Tracker</p>
+          <h1 style={{fontSize:28,fontWeight:"bold",margin:0,letterSpacing:-0.5}}>Rita's Chart</h1>
+          <p style={{fontSize:13,opacity:0.6,marginTop:4,fontStyle:"italic"}}>📍 The Homestead</p>
+        </div>
+        <div style={{display:"flex",gap:8,padding:"16px 16px 0"}}>
+          {RANGES.map(r=>(
+            <button key={r.label} style={{...S.tog(chartRange===r.hours),flex:1,padding:"8px 0"}}
+              onClick={()=>setChartRange(r.hours)}>{r.label}</button>
+          ))}
+        </div>
+        <div style={{...S.card,padding:"14px 16px"}}>
+          <div style={{display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:12}}>
+            <span style={S.lbl}>Alert Thresholds</span>
+            <button onClick={()=>{setPendingLow(LOW);setPendingHigh(HIGH);setPendingUrl(settings.sheetsUrl||"");setView("settings");}}
+              style={{background:"none",border:"none",color:"#2D5A3D",fontSize:12,cursor:"pointer",fontFamily:"Georgia,serif"}}>
+              Full settings ⚙️
+            </button>
+          </div>
+          <div style={{display:"flex",gap:16,alignItems:"center"}}>
+            {[{key:"lowThreshold",label:"Low Limit",color:"#FF6B6B",val:LOW,min:40,max:HIGH-5},
+              {key:"highThreshold",label:"High Limit",color:"#F4A261",val:HIGH,min:LOW+5,max:300}].map(({key,label,color,val,min,max})=>(
+              <div key={key} style={{flex:1}}>
+                <div style={{fontSize:11,color,letterSpacing:1,textTransform:"uppercase",marginBottom:6}}>{label}</div>
+                <div style={{display:"flex",alignItems:"center",gap:6}}>
+                  <button onClick={()=>setSettings(s=>({...s,[key]:Math.max(min,s[key]-5)}))}
+                    style={{width:28,height:28,borderRadius:14,border:"1.5px solid #E0DDD8",background:"white",
+                      cursor:"pointer",fontSize:16,display:"flex",alignItems:"center",justifyContent:"center",color,fontWeight:"bold"}}>−</button>
+                  <div style={{flex:1,textAlign:"center",fontSize:20,fontWeight:"bold",color}}>{val}</div>
+                  <button onClick={()=>setSettings(s=>({...s,[key]:Math.min(max,s[key]+5)}))}
+                    style={{width:28,height:28,borderRadius:14,border:"1.5px solid #E0DDD8",background:"white",
+                      cursor:"pointer",fontSize:16,display:"flex",alignItems:"center",justifyContent:"center",color,fontWeight:"bold"}}>+</button>
+                </div>
+              </div>
+            ))}
+          </div>
+        </div>
+        <div style={{...S.card,padding:"20px 8px 16px 4px"}}>
+          <div style={{paddingLeft:12,marginBottom:10}}>
+            <span style={S.lbl}>Blood Glucose Over Time</span>
+            <div style={{display:"flex",gap:10,fontSize:11,color:"#888",flexWrap:"wrap"}}>
+              <span><span style={{color:"#FF6B6B"}}>●</span> Low &lt;{LOW}</span>
+              <span><span style={{color:"#4CAF8A"}}>●</span> Normal {LOW}–{HIGH}</span>
+              <span><span style={{color:"#F4A261"}}>●</span> High &gt;{HIGH}</span>
+            </div>
+          </div>
+          {chartData.length < 2 ? (
+            <div style={{textAlign:"center",padding:"40px 0",color:"#aaa"}}>
+              <div style={{fontSize:32}}>📊</div>
+              <p style={{fontSize:13}}>Add at least 2 readings to see the chart</p>
+            </div>
+          ) : (
+            <ResponsiveContainer width="100%" height={260}>
+              <ComposedChart data={chartData} margin={{top:24,right:16,left:0,bottom:0}}>
+                <defs>
+                  <linearGradient id="gGrad" x1="0" y1="0" x2="0" y2="1">
+                    <stop offset="5%" stopColor="#2D5A3D" stopOpacity={0.2}/>
+                    <stop offset="95%" stopColor="#2D5A3D" stopOpacity={0}/>
+                  </linearGradient>
+                </defs>
+                <CartesianGrid strokeDasharray="3 3" stroke="#F0EDE8" vertical={false}/>
+                <ReferenceLine y={HIGH} stroke="#F4A261" strokeDasharray="5 3" strokeWidth={1.5}
+                  label={{value:`High ${HIGH}`,position:"insideTopRight",fontSize:10,fill:"#F4A261",dy:-4}}/>
+                <ReferenceLine y={LOW}  stroke="#FF6B6B" strokeDasharray="5 3" strokeWidth={1.5}
+                  label={{value:`Low ${LOW}`,position:"insideBottomRight",fontSize:10,fill:"#FF6B6B",dy:4}}/>
+                <XAxis dataKey="timestamp"
+                  tickFormatter={v=>new Date(v).toLocaleDateString("en-US",{month:"short",day:"numeric"})}
+                  tick={{fontSize:10,fill:"#aaa",fontFamily:"Georgia,serif"}} axisLine={false} tickLine={false} interval="preserveStartEnd"/>
+                <YAxis domain={[yMin,yMax]} tick={{fontSize:10,fill:"#aaa",fontFamily:"Georgia,serif"}} axisLine={false} tickLine={false} width={36}/>
+                <Tooltip content={<ChartTip/>}/>
+                <Area type="monotone" dataKey="glucose" stroke="#2D5A3D" strokeWidth={2.5}
+                  fill="url(#gGrad)" dot={<ChartDot/>} activeDot={false}/>
+              </ComposedChart>
+            </ResponsiveContainer>
+          )}
+        </div>
+        {chartData.length > 0 && (
+          <div style={S.card}>
+            <span style={S.lbl}>Time in Range · {chartRange?(chartRange>=168?"Last 7 days":`Last ${chartRange}h`):"All time"}</span>
+            <div style={{display:"flex"}}>
+              {["LOW","NORMAL","HIGH"].map((key,ki)=>{
+                const count = chartData.filter(l=>liveStatus(l.glucose)===key).length;
+                const pct   = chartData.length ? Math.round((count/chartData.length)*100) : 0;
+                return (
+                  <div key={key} style={{flex:1,textAlign:"center",borderRight:ki<2?"1px solid #F0EDE8":"none",padding:"0 4px"}}>
+                    <div style={{fontSize:26,fontWeight:"bold",color:STATUS[key].color}}>{pct}%</div>
+                    <div style={{fontSize:11,color:"#aaa"}}>{STATUS[key].label}</div>
+                    <div style={{fontSize:11,color:"#ccc"}}>{count} readings</div>
+                  </div>
+                );
+              })}
+            </div>
+          </div>
+        )}
+        <div style={{height:80}}/>
+        <NavBar active="chart"/>
+      </div>
+    );
+  }
+
+  // ── DETAIL VIEW ────────────────────────────────────────────────────────────
+  if (view === "detail" && selectedLog) {
+    const log   = selectedLog;
+    const shots = log.screenshots || [];
+    const ls    = liveStatus(log.glucose);
+    return (
+      <div style={S.app}>
+        {lightbox && <Lightbox screenshots={lightbox.screenshots} startIndex={lightbox.startIndex} onClose={()=>setLightbox(null)}/>}
+        {showDeleteConfirm && <DeleteModal onConfirm={()=>deleteLog(log.id)} onCancel={()=>setShowDeleteConfirm(false)}/>}
+        <div style={{...S.hdr,background:`linear-gradient(135deg,${STATUS[ls].color}CC,${STATUS[ls].color})`}}>
+          <div style={{display:"flex",justifyContent:"space-between",alignItems:"flex-start"}}>
+            <button style={S.backBtn} onClick={()=>setView("home")}>← Back</button>
+            <button onClick={()=>openEdit(log)}
+              style={{background:"rgba(255,255,255,0.2)",border:"1.5px solid rgba(255,255,255,0.5)",
+                color:"white",borderRadius:20,padding:"6px 16px",fontSize:13,cursor:"pointer",
+                fontFamily:"Georgia,serif",marginTop:-4}}>✏️ Edit</button>
+          </div>
+          <div style={{display:"flex",alignItems:"flex-end",gap:16}}>
+            <span style={{fontSize:64,fontWeight:"bold",lineHeight:1,color:"white"}}>{log.glucose}</span>
+            <div style={{paddingBottom:8}}>
+              <div style={{color:"rgba(255,255,255,0.9)",fontWeight:"bold",fontSize:18}}>mg/dL</div>
+              <div style={{color:"rgba(255,255,255,0.7)",fontSize:13}}>{STATUS[ls].label}</div>
+            </div>
+          </div>
+          <p style={{margin:"8px 0 0",opacity:0.8,fontSize:14}}>{fmtDate(log.timestamp)} at {fmtTime(log.timestamp)}</p>
+          {(shots.length > 0 || log.screenshotCount > 0) && (
+            <p style={{margin:"4px 0 0",opacity:0.65,fontSize:12}}>
+              📷 {shots.length || log.screenshotCount} screenshot{(shots.length||log.screenshotCount)>1?"s":""} attached
+            </p>
+          )}
+        </div>
+        <div style={{padding:"0 0 100px"}}>
+          <div style={S.card}>
+            <label style={S.lbl}>The Homestead</label>
+            {log.calledHomestead ? (
+              <div style={{display:"flex",alignItems:"center",gap:10}}>
+                <span style={{fontSize:24}}>📞</span>
+                <div>
+                  <div style={{fontWeight:"bold"}}>Called The Homestead</div>
+                  {log.calledTime && <div style={{fontSize:13,color:"#888"}}>at {fmtTime(log.calledTime)} on {fmtDate(log.calledTime)}</div>}
+                </div>
+              </div>
+            ) : <div style={{color:"#aaa",fontStyle:"italic"}}>Not called</div>}
+          </div>
+          <div style={S.card}>
+            <label style={S.lbl}>Interventions</label>
+            {!log.interventions?.length
+              ? <div style={{color:"#aaa",fontStyle:"italic"}}>None given</div>
+              : log.interventions.map((inv,i)=>(
+                <div key={i} style={{display:"flex",alignItems:"center",gap:12,padding:"10px 0",
+                  borderBottom:i<log.interventions.length-1?"1px solid #F0EDE8":"none"}}>
+                  <span style={{fontSize:20}}>💊</span>
+                  <div>
+                    <div style={{fontWeight:"bold"}}>{inv.name}</div>
+                    {inv.quantity && <div style={{fontSize:13,color:"#888"}}>{inv.quantity}</div>}
+                    {inv.time && <div style={{fontSize:12,color:"#aaa"}}>Given at {fmtTime(inv.time)}</div>}
+                  </div>
+                </div>
+              ))}
+          </div>
+          <div style={S.card}>
+            <label style={S.lbl}>Screenshots {shots.length > 0 && <span style={{color:"#2D5A3D"}}>· {shots.length}</span>}</label>
+            {shots.length === 0
+              ? <div style={{color:"#aaa",fontStyle:"italic",fontSize:13,marginTop:6}}>
+                  {log.screenshotCount > 0
+                    ? `${log.screenshotCount} screenshot${log.screenshotCount>1?"s":""} were attached on the original device`
+                    : "No screenshots attached"}
+                </div>
+              : <>
+                  <div style={{display:"flex",flexWrap:"wrap",margin:"0 -4px"}}>
+                    {shots.map((s,i)=>(
+                      <ScreenshotThumb key={i} src={s.data} label={s.name}
+                        onClick={()=>setLightbox({screenshots:shots,startIndex:i})}/>
+                    ))}
+                  </div>
+                  <p style={{margin:"10px 0 0",fontSize:11,color:"#bbb"}}>Tap any image to view full screen</p>
+                </>
+            }
+          </div>
+          {log.notes && (
+            <div style={S.card}>
+              <label style={S.lbl}>Notes</label>
+              <p style={{margin:0,lineHeight:1.6}}>{log.notes}</p>
+            </div>
+          )}
+          <div style={{padding:"0 16px",display:"flex",flexDirection:"column",gap:10}}>
+            <button style={S.primBtn} onClick={()=>openEdit(log)}>✏️ Edit Reading</button>
+            <button onClick={()=>setShowDeleteConfirm(true)}
+              style={{...S.primBtn,background:"transparent",color:"#FF6B6B",border:"1.5px solid #FF6B6B"}}>
+              Delete Reading
+            </button>
+          </div>
+        </div>
+      </div>
+    );
+  }
+
+  // ── HOME VIEW ─────────────────────────────────────────────────────────────
+  return (
+    <div style={S.app}>
+      {lightbox && <Lightbox screenshots={lightbox.screenshots} startIndex={lightbox.startIndex} onClose={()=>setLightbox(null)}/>}
+      <div style={S.hdr}>
+        <div style={{display:"flex",justifyContent:"space-between",alignItems:"flex-start"}}>
+          <div>
+            <p style={{fontSize:13,opacity:0.7,letterSpacing:2,textTransform:"uppercase",marginBottom:4}}>Glucose Tracker</p>
+            <h1 style={{fontSize:28,fontWeight:"bold",margin:0,letterSpacing:-0.5}}>Rita's Health</h1>
+            <p style={{fontSize:13,opacity:0.6,marginTop:4,fontStyle:"italic"}}>📍 The Homestead</p>
+          </div>
+          <div style={{marginTop:8,fontSize:10,opacity:0.8,textAlign:"right",fontFamily:"Georgia,serif"}}>
+            {syncStatus==="synced" && <span>✅ Sheets synced</span>}
+            {syncStatus==="syncing" && <span>⏳ Saving…</span>}
+            {syncStatus==="error" && <span>⚠️ Sync failed</span>}
+            {syncStatus==="offline" && <span>💾 Local only</span>}
+          </div>
+        </div>
+        {lastEntry && (
+          <div style={{marginTop:20,background:"rgba(255,255,255,0.1)",borderRadius:12,padding:16}}>
+            <p style={{margin:0,fontSize:12,opacity:0.7,letterSpacing:1}}>LAST READING</p>
+            <div style={{display:"flex",alignItems:"flex-end",gap:12,marginTop:4}}>
+              <span style={{fontSize:52,fontWeight:"bold",lineHeight:1,color:STATUS[liveStatus(lastEntry.glucose)].color}}>
+                {lastEntry.glucose}
+              </span>
+              <div style={{paddingBottom:8}}>
+                <div style={S.badge(liveStatus(lastEntry.glucose))}>
+                  {STATUS[liveStatus(lastEntry.glucose)].icon} {STATUS[liveStatus(lastEntry.glucose)].label}
+                </div>
+                <p style={{margin:"4px 0 0",fontSize:12,opacity:0.7}}>{fmtDate(lastEntry.timestamp)} · {fmtTime(lastEntry.timestamp)}</p>
+              </div>
+            </div>
+          </div>
+        )}
+      </div>
+
+      {sparkData.length >= 2 && (
+        <div style={{...S.card,paddingBottom:12}}>
+          <div style={{display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:8}}>
+            <span style={S.lbl}>48h Trend</span>
+            <button onClick={()=>setView("chart")}
+              style={{background:"none",border:"none",color:"#2D5A3D",fontSize:12,cursor:"pointer",fontFamily:"Georgia,serif"}}>
+              Full chart →
+            </button>
+          </div>
+          <ResponsiveContainer width="100%" height={80}>
+            <AreaChart data={sparkData} margin={{top:5,right:5,left:0,bottom:0}}>
+              <defs>
+                <linearGradient id="spark" x1="0" y1="0" x2="0" y2="1">
+                  <stop offset="5%"  stopColor="#2D5A3D" stopOpacity={0.2}/>
+                  <stop offset="95%" stopColor="#2D5A3D" stopOpacity={0}/>
+                </linearGradient>
+              </defs>
+              <ReferenceLine y={HIGH} stroke="#F4A261" strokeDasharray="3 2" strokeWidth={1}/>
+              <ReferenceLine y={LOW}  stroke="#FF6B6B" strokeDasharray="3 2" strokeWidth={1}/>
+              <Area type="monotone" dataKey="glucose" stroke="#2D5A3D" strokeWidth={2} fill="url(#spark)"
+                dot={(props)=>{
+                  const {cx,cy,payload}=props;
+                  if(!cx||!cy||!payload) return null;
+                  return <circle key={cx} cx={cx} cy={cy} r={3} fill={STATUS[liveStatus(payload.glucose)].color} stroke="white" strokeWidth={1}/>;
+                }}/>
+            </AreaChart>
+          </ResponsiveContainer>
+        </div>
+      )}
+
+      <div style={{display:"flex",gap:10,padding:"0 16px"}}>
+        {Object.entries(counts).map(([key,count])=>(
+          <div key={key} style={{flex:1,background:STATUS[key].bg,borderRadius:12,padding:12,
+            textAlign:"center",border:`1px solid ${STATUS[key].color}30`}}>
+            <div style={{fontSize:22,fontWeight:"bold",color:STATUS[key].color}}>{count}</div>
+            <div style={{fontSize:11,color:STATUS[key].color,opacity:0.8,letterSpacing:1}}>{key}</div>
+          </div>
+        ))}
+      </div>
+
+      {!settings.sheetsUrl && logs.length === 0 && (
+        <div style={{...S.card,textAlign:"center",padding:24}}>
+          <div style={{fontSize:36,marginBottom:10}}>🟢</div>
+          <p style={{margin:"0 0 12px",fontWeight:"bold",fontSize:15}}>Connect Google Sheets</p>
+          <p style={{margin:"0 0 16px",fontSize:13,color:"#888",lineHeight:1.5}}>
+            Store readings in your own Google Sheet so data persists across devices.
+          </p>
+          <button style={{...S.primBtn}} onClick={()=>{setPendingLow(LOW);setPendingHigh(HIGH);setPendingUrl("");setView("settings");}}>
+            Set Up Google Sheets →
+          </button>
+          <button style={{...S.primBtn,background:"transparent",color:"#888",border:"none",marginTop:8,fontSize:13,fontWeight:"normal"}}
+            onClick={openAdd}>Or just add a reading →</button>
+        </div>
+      )}
+
+      <div style={{display:"flex",gap:8,padding:"12px 16px",overflowX:"auto"}}>
+        {["ALL","LOW","NORMAL","HIGH"].map(f=>(
+          <button key={f} style={S.tog(filter===f)} onClick={()=>setFilter(f)}>
+            {f==="ALL"?"All":`${STATUS[f]?.icon||""} ${f}`}
+          </button>
+        ))}
+      </div>
+
+      {logs.length > 0 && (
+        <div style={{...S.card,paddingBottom:4}}>
+          {(filter==="ALL"?sortedLogs:sortedLogs.filter(l=>liveStatus(l.glucose)===filter)).length === 0 ? (
+            <div style={{textAlign:"center",padding:"40px 0",color:"#aaa"}}>
+              <div style={{fontSize:40}}>📊</div>
+              <p style={{marginTop:12}}>No {filter.toLowerCase()} readings.</p>
+            </div>
+          ) : (
+            (filter==="ALL"?sortedLogs:sortedLogs.filter(l=>liveStatus(l.glucose)===filter)).map(log=>(
+              <div key={log.id} style={{display:"flex",alignItems:"center",gap:12,padding:"14px 0",
+                borderBottom:"1px solid #F0EDE8",cursor:"pointer"}}
+                onClick={()=>{setSelectedLog(log);setView("detail");}}>
+                {log.screenshots?.length > 0 ? (
+                  <div style={{position:"relative",flexShrink:0}}>
+                    <img src={log.screenshots[0].data} alt="" style={{width:50,height:50,objectFit:"cover",
+                      borderRadius:10,border:`2px solid ${STATUS[liveStatus(log.glucose)].color}`}}/>
+                    {log.screenshots.length > 1 && (
+                      <div style={{position:"absolute",bottom:2,right:2,background:"rgba(0,0,0,0.6)",
+                        borderRadius:4,padding:"1px 4px",fontSize:9,color:"white"}}>+{log.screenshots.length-1}</div>
+                    )}
+                  </div>
+                ) : (
+                  <div style={S.circle(liveStatus(log.glucose))}>{log.glucose}</div>
+                )}
+                <div style={{flex:1}}>
+                  <div style={{display:"flex",alignItems:"center",gap:8}}>
+                    <span style={{fontWeight:"bold",fontSize:15}}>{log.glucose} mg/dL</span>
+                    <span style={{...S.badge(liveStatus(log.glucose)),fontSize:11,padding:"2px 8px"}}>
+                      {STATUS[liveStatus(log.glucose)].label}
+                    </span>
+                  </div>
+                  <div style={{fontSize:12,color:"#888",marginTop:2}}>{fmtDate(log.timestamp)} · {fmtTime(log.timestamp)}</div>
+                  {log.calledHomestead && <div style={{fontSize:11,color:"#2D5A3D",marginTop:2}}>📞 Called The Homestead</div>}
+                  {log.interventions?.length > 0 && (
+                    <div style={{fontSize:11,color:"#888",marginTop:2}}>
+                      💊 {log.interventions.map(i=>`${i.name}${i.quantity?` (${i.quantity})`:""}`).join(", ")}
+                    </div>
+                  )}
+                  {(log.screenshots?.length > 0 || log.screenshotCount > 0) && (
+                    <div style={{fontSize:11,color:"#888",marginTop:2}}>
+                      📷 {log.screenshots?.length||log.screenshotCount} screenshot{(log.screenshots?.length||log.screenshotCount)>1?"s":""}
+                    </div>
+                  )}
+                </div>
+                <span style={{color:"#ccc",fontSize:18}}>›</span>
+              </div>
+            ))
+          )}
+        </div>
+      )}
+
+      <div style={{height:80}}/>
+      <NavBar active="home"/>
+    </div>
+  );
+}
+
+    // Mount
+    const root = ReactDOM.createRoot(document.getElementById('root'));
+    root.render(React.createElement(RitaGlucoseTracker));
+  </script>
+</body>
+</html>
