@@ -382,16 +382,12 @@ function RitaGlucoseTracker() {
     if (!settings.sheetsUrl) return;
     setSyncStatus("syncing");
     try {
-      // Send full screenshot data so script can upload to Drive
-      const res = await sheetsPost(settings.sheetsUrl, {action:"save", entry});
+      const res = await sheetsPost(settings.sheetsUrl, {action:"save", entry:{
+        ...entry,
+        screenshotCount: entry.screenshots?.length || 0,
+        screenshots: undefined,
+      }});
       if (res.ok) {
-        // Update entry in local state with Drive URLs returned from script
-        if (res.screenshots && res.screenshots.length > 0) {
-          const updated = {...entry, screenshots: res.screenshots.map(s => ({
-            ...s, data: s.url // use Drive URL as display source
-          }))};
-          setLogs(prev => prev.map(l => l.id === entry.id ? updated : l));
-        }
         setSyncStatus("synced");
       } else {
         setSyncError(res.error || "Save failed");
