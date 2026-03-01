@@ -359,10 +359,9 @@ function RitaGlucoseTracker() {
           // Map Drive URL screenshots so they display correctly
           const entries = (data.entries || []).map(e => ({
             ...e,
-            screenshots: (e.screenshots || []).map(s => ({
-              ...s,
-              data: s.url || s.data // Drive URL or base64
-            }))
+            screenshots: Array.isArray(e.screenshots)
+              ? e.screenshots.map(s => ({ ...s, data: s.url || s.data }))
+              : []
           }));
           setLogs(entries);
           setSyncStatus("synced");
