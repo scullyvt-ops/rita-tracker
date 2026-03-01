@@ -392,31 +392,31 @@ function RitaGlucoseTracker() {
     if (!settings.sheetsUrl) return;
     setSyncStatus("syncing");
     try {
-      // Step 1: Save reading without image data (fast, small payload)
+      const newScreenshots = (entry.screenshots||[]).filter(s => s.data && s.data.startsWith("data:"));
+      const existingScreenshots = (entry.screenshots||[]).filter(s => s.url);
+
+      // Step 1: Save reading with placeholder for new screenshots
       const entryNoImages = {
         ...entry,
-        screenshots: (entry.screenshots||[]).map(s => s.url ? {url:s.url,name:s.name} : {name:s.name||"screenshot"}),
+        screenshots: existingScreenshots,
         screenshotCount: entry.screenshots?.length || 0
       };
       const res = await sheetsPost(settings.sheetsUrl, {action:"save", entry: entryNoImages});
       if (!res.ok) { setSyncError(res.error||"Save failed"); setSyncStatus("error"); return; }
       setSyncStatus("synced");
 
-      // Step 2: Upload each new screenshot individually (background)
-      const newScreenshots = (entry.screenshots||[]).filter(s => s.data && s.data.startsWith("data:"));
+      // Step 2: Upload new screenshots one at a time, now that the row exists in the sheet
       if (newScreenshots.length > 0) {
-        const driveScreenshots = [...(entry.screenshots||[]).filter(s => s.url)];
+        const driveScreenshots = [...existingScreenshots];
         for (let i = 0; i < newScreenshots.length; i++) {
           try {
-            const r = await sheetsUploadScreenshot(settings.sheetsUrl, entry.id, newScreenshots[i], i);
+            const r = await sheetsUploadScreenshot(settings.sheetsUrl, String(entry.id), newScreenshots[i], i);
             if (r.ok && r.url) driveScreenshots.push({url:r.url, name:newScreenshots[i].name||"screenshot", data:r.url});
-          } catch(e) { /* skip failed uploads */ }
+          } catch(e) { console.error("Screenshot upload failed:", e); }
         }
-        if (driveScreenshots.length > 0) {
+        if (driveScreenshots.length > existingScreenshots.length) {
           const updated = {...entry, screenshots: driveScreenshots};
           setLogs(prev => prev.map(l => String(l.id) === String(entry.id) ? updated : l));
-          // Save again with Drive URLs
-          await sheetsPost(settings.sheetsUrl, {action:"save", entry:{...entryNoImages, screenshots: driveScreenshots}});
         }
       }
     } catch(e) { setSyncError(e.message); setSyncStatus("error"); }
