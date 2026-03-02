@@ -410,6 +410,7 @@ function RitaGlucoseTracker() {
         const driveScreenshots = [...existingScreenshots];
         for (let i = 0; i < newScreenshots.length; i++) {
           try {
+            console.log("Uploading screenshot for entry ID:", entry.id, "type:", typeof entry.id);
             const r = await sheetsUploadScreenshot(settings.sheetsUrl, String(entry.id), newScreenshots[i], i);
             if (r.ok && r.url) driveScreenshots.push({url:r.url, name:newScreenshots[i].name||"screenshot", data:r.url});
           } catch(e) { console.error("Screenshot upload failed:", e); }
@@ -1196,7 +1197,6 @@ function RitaGlucoseTracker() {
     </div>
   );
 }
-
     const root = ReactDOM.createRoot(document.getElementById('root'));
     root.render(React.createElement(RitaGlucoseTracker));
   </script>
