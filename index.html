@@ -432,12 +432,12 @@ function RitaGlucoseTracker() {
           // Map Drive URL screenshots so they display correctly
           // Load readings from Sheets, then restore screenshots from IndexedDB
           const entries = data.entries || [];
-          const withScreenshots = await Promise.all(entries.map(async e => {
-            const shots = await loadScreenshotsFromDB(e.id);
-            return { ...e, screenshots: shots };
-          }));
-          setLogs(withScreenshots);
-          setSyncStatus("synced");
+          Promise.all(entries.map(e =>
+            loadScreenshotsFromDB(e.id).then(shots => ({ ...e, screenshots: shots }))
+          )).then(withScreenshots => {
+            setLogs(withScreenshots);
+            setSyncStatus("synced");
+          });
         } else {
           setSyncStatus("error");
         }
