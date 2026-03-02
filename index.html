@@ -137,18 +137,6 @@ async function sheetsCall(url, payload) {
   return json;
 }
 
-// Upload a single screenshot — sends as separate small request
-async function sheetsUploadScreenshot(url, entryId, screenshot, index) {
-  // Compress image to reduce size before sending via URL
-  const compressed = await compressImage(screenshot.data, 600, 0.5);
-  const payload = {
-    action: "uploadScreenshot",
-    entryId: String(entryId),
-    screenshot: { data: compressed, name: screenshot.name || ("screenshot_" + index + ".jpg") }
-  };
-  return sheetsCall(url, payload);
-}
-
 const sheetsGet  = (url)       => sheetsCall(url, null);
 const sheetsPost = (url, body) => sheetsCall(url, body);
 
